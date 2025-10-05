@@ -1,4 +1,4 @@
-Handwritten Equation Solver
+# Handwritten Equation Solver
 
 This project recognizes and solves handwritten arithmetic expressions.
 
