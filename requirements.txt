@@ -1,0 +1,10 @@
+opencv-python-headless
+numpy
+pillow
+matplotlib
+torch
+torchvision
+gradio
+scikit-image
+albumentations
+tqdm
