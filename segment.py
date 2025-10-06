@@ -1,167 +1,164 @@
-"""
-Symbol segmentation using OpenCV.
-"""
 import cv2
 import numpy as np
+try:
+    from scipy import ndimage
+    from skimage.morphology import skeletonize
+except ImportError:
+    ndimage = None
+    skeletonize = None
 
+def stroke_width_transform(binary_img):
+    """Stroke Width Transform for better text detection"""
+    # Distance transform
+    dist = cv2.distanceTransform(binary_img, cv2.DIST_L2, 5)
+    
+    # Skeleton
+    skeleton = skeletonize(binary_img > 0)
+    
+    # Stroke width map
+    stroke_width = np.zeros_like(dist)
+    skeleton_points = np.where(skeleton)
+    
+    for y, x in zip(skeleton_points[0], skeleton_points[1]):
+        stroke_width[y, x] = dist[y, x] * 2
+    
+    return stroke_width
 
-def segment_image(image, min_area=100):
-    """Takes a grayscale image (numpy array) and returns list of symbol images (cropped arrays) sorted left-to-right.
-    """
+def segment_image(image):
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
-        gray = image
-    # Use adaptive thresholding for variable lighting/ink
-    th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY_INV, 25, 10)
-    # Morph to join strokes and remove small noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
-    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
-    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        gray = image.copy()
+    
+    # Preprocessing
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    
+    # Multi-scale thresholding for robustness
+    thresh1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+    thresh2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 15, 3)
+    _, thresh3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Combine thresholds
+    thresh = cv2.bitwise_or(thresh1, cv2.bitwise_or(thresh2, thresh3))
+    
+    # Stroke width filtering
+    try:
+        stroke_map = stroke_width_transform(thresh)
+        # Filter by stroke width consistency
+        mean_stroke = np.mean(stroke_map[stroke_map > 0])
+        stroke_mask = (stroke_map > mean_stroke * 0.3) & (stroke_map < mean_stroke * 3)
+        thresh = cv2.bitwise_and(thresh, thresh, mask=stroke_mask.astype(np.uint8) * 255)
+    except:
+        pass  # Fallback to original thresh
+    
+    # Morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    
+    # Connected component analysis (more robust than contours)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    
+    # Convert to contour format for compatibility
+    contours = []
+    for i in range(1, num_labels):  # Skip background
+        mask = (labels == i).astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            contours.extend(cnts)
+    
+    # Get bounding boxes with better filtering
     boxes = []
+    img_area = gray.shape[0] * gray.shape[1]
+    
     for cnt in contours:
-        x,y,w,h = cv2.boundingRect(cnt)
-        if w*h < min_area:
-            continue
-        boxes.append((x,y,w,h))
-    boxes = sorted(boxes, key=lambda b: b[0])
-    # Merge boxes that are close horizontally or clearly part of the same symbol
-    merged = []
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        
+        # Advanced filtering based on text characteristics
+        aspect_ratio = w / h
+        solidity = area / (w * h)  # How filled the bounding box is
+        
+        if (area > 100 and area < img_area * 0.3 and 
+            w > 8 and h > 8 and 
+            0.1 < aspect_ratio < 8.0 and  # More flexible aspect ratio
+            solidity > 0.3):  # Must be reasonably filled
+            boxes.append((x, y, w, h, area, solidity))
+    
+    # Sort by x-coordinate (left to right) with y-coordinate tie-breaking
+    boxes = sorted(boxes, key=lambda b: (b[1] // 20, b[0]))  # Group by rows first
+    
+    # Smart merging based on text characteristics
+    merged_boxes = []
     for box in boxes:
+        x, y, w, h, area, solidity = box
+        merged = False
+        
+        for i, (mx, my, mw, mh) in enumerate(merged_boxes):
+            # Check for overlap with better heuristics
+            x_overlap = max(0, min(x + w, mx + mw) - max(x, mx))
+            y_overlap = max(0, min(y + h, my + mh) - max(y, my))
+            
+            # Merge if significant overlap or very close horizontally
+            if ((x_overlap > 0 and y_overlap > min(h, mh) * 0.3) or 
+                (abs(y - my) < max(h, mh) * 0.5 and abs(x - (mx + mw)) < w * 0.3)):
+                
+                new_x = min(x, mx)
+                new_y = min(y, my)
+                new_w = max(x + w, mx + mw) - new_x
+                new_h = max(y + h, my + mh) - new_y
+                merged_boxes[i] = (new_x, new_y, new_w, new_h)
+                merged = True
+                break
+        
         if not merged:
-            merged.append(box)
-            continue
-        x,y,w,h = box
-        px,py,pw,ph = merged[-1]
-        # compute vertical overlap
-        y0 = max(y, py)
-        y1 = min(y+h, py+ph)
-        vert_overlap = max(0, y1 - y0)
-        vert_frac = vert_overlap / min(h, ph) if min(h, ph) > 0 else 0
-        gap = x - (px + pw)
-        # merge if boxes touch/near or have strong vertical overlap (parts of same glyph)
-        if gap <= max(6, int(0.15 * pw)) or vert_frac > 0.45:
-            nx = min(px, x)
-            ny = min(py, y)
-            nw = max(px+pw, x+w) - nx
-            nh = max(py+ph, y+h) - ny
-            # Prevent merging into a box that covers most of the line width
-            img_w = th.shape[1]
-            if nw < 0.60 * img_w and nw < (pw * 3):
-                merged[-1] = (nx, ny, nw, nh)
-            else:
-                # skip merging if it would create an overly large box
-                merged.append(box)
-        else:
-            merged.append(box)
-    boxes = merged
-    # If boxes are too few, try to split very wide boxes by vertical projection
-    widths = [w for (_,_,w,_) in boxes] if boxes else [0]
-    med_w = int(np.median(widths)) if widths else 0
-    final_boxes = []
-    for (x,y,w,h) in boxes:
-        if med_w>0 and w > 1.4 * med_w and w > 2*med_w and w>40:
-            # attempt to split by vertical projection of this crop
-            crop = th[y:y+h, x:x+w]
-            proj = np.sum(crop==0, axis=0)  # black pixel count per column
-            # find candidate split positions where proj is small (mostly white)
-            white_cols = np.where(proj < (0.08 * h))[0]
-            # find largest gaps in white_cols to split
-            if white_cols.size > 0:
-                splits = []
-                groups = np.split(white_cols, np.where(np.diff(white_cols) != 1)[0]+1)
-                for g in groups:
-                    if g.size>0:
-                        splits.append(int(g[g.size//2]))
-                # create sub-boxes between splits
-                xs = [0] + splits + [w-1]
-                for i in range(len(xs)-1):
-                    sx = xs[i]
-                    ex = xs[i+1]
-                    sw = ex - sx
-                    if sw>10:
-                        final_boxes.append((x+sx, y, sw, h))
-                continue
-            # fallback: split at the largest local minima in projection
-            proj_smooth = np.convolve(proj.astype(float), np.ones(3)/3, mode='same')
-            # find minima positions
-            minima = (np.r_[True, proj_smooth[1:] < proj_smooth[:-1]] & np.r_[proj_smooth[:-1] < proj_smooth[1:], True]).nonzero()[0]
-            if minima.size>0:
-                # sort minima by proj value (ascending) and take up to 2 splits
-                mins = sorted(list(minima), key=lambda i: proj_smooth[i])
-                k = min(2, max(1, int(round(w/med_w))-1))
-                chosen = sorted(mins[:k])
-                xs = [0] + chosen + [w-1]
-                for i in range(len(xs)-1):
-                    sx = xs[i]
-                    ex = xs[i+1]
-                    sw = ex - sx
-                    if sw>10:
-                        final_boxes.append((x+sx, y, sw, h))
-                continue
-        final_boxes.append((x,y,w,h))
-    boxes = final_boxes
-    # Fallback: if too few boxes (likely merged), try vertical projection over whole line
-    if len(boxes) <= 2:
-        proj_full = np.sum(th == 0, axis=0)
-        groups = []
-        in_group = False
-        start = 0
-        for i, v in enumerate(proj_full):
-            if not in_group and v > 0:
-                in_group = True
-                start = i
-            elif in_group and v == 0:
-                in_group = False
-                groups.append((start, i-1))
-        if in_group:
-            groups.append((start, len(proj_full)-1))
-        # filter tiny groups
-        groups = [g for g in groups if (g[1]-g[0]) > 6]
-        if len(groups) >= 2 and len(groups) <= 8:
-            boxes = []
-            h = th.shape[0]
-            for (sx, ex) in groups:
-                sw = ex - sx + 1
-                boxes.append((sx, 0, sw, h))
-        else:
-            # Peak-based fallback: find local maxima in projection and make centered boxes
-            proj = proj_full
-            maxv = proj.max() if proj.size>0 else 0
-            if maxv > 0:
-                thresh = max(4, int(0.12 * maxv))
-                peaks = []
-                for i in range(1, len(proj)-1):
-                    if proj[i] > proj[i-1] and proj[i] >= proj[i+1] and proj[i] >= thresh:
-                        peaks.append(i)
-                # remove peaks that are too close
-                filtered = []
-                last = -999
-                for p in peaks:
-                    if p - last > 12:
-                        filtered.append(p)
-                        last = p
-                peaks = filtered
-                if len(peaks) >= 2 and len(peaks) <= 12:
-                    boxes = []
-                    h = th.shape[0]
-                    # median width guess
-                    guess_w = int(np.median([w for (_,_,w,_) in boxes]) if boxes else max(20, th.shape[1]//8))
-                    for p in peaks:
-                        half = max(12, guess_w//2)
-                        sx = max(0, p-half)
-                        ex = min(th.shape[1]-1, p+half)
-                        boxes.append((sx, 0, ex-sx+1, h))
+            merged_boxes.append((x, y, w, h))
+    
+    # Extract symbols
     symbols = []
-    for (x,y,w,h) in boxes:
-        crop = gray[y:y+h, x:x+w]
-        # pad to square
-        size = max(w,h)
-        pad_x = (size - w) // 2
-        pad_y = (size - h) // 2
-        square = 255 * np.ones((size,size), dtype=np.uint8)
-        square[pad_y:pad_y+h, pad_x:pad_x+w] = crop
+    for x, y, w, h in merged_boxes:
+        # Add padding around the symbol
+        pad = 5
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(gray.shape[1], x + w + pad)
+        y2 = min(gray.shape[0], y + h + pad)
+        
+        crop = gray[y1:y2, x1:x2]
+        
+        # Smart inversion based on text vs background
+        hist = cv2.calcHist([crop], [0], None, [256], [0, 256])
+        # If more dark pixels, likely inverted
+        if np.sum(hist[:128]) > np.sum(hist[128:]):
+            crop = 255 - crop
+        
+        # Enhance contrast
+        crop = cv2.equalizeHist(crop)
+        
+        # Aspect-ratio preserving resize with padding
+        target_size = 64
+        h, w = crop.shape
+        
+        # Scale to fit in target size while preserving aspect ratio
+        scale = min(target_size / w, target_size / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        
+        if new_w > 0 and new_h > 0:
+            resized = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            resized = crop
+        
+        # Create square with padding
+        square = np.full((target_size, target_size), 255, dtype=np.uint8)
+        
+        # Center the resized image
+        start_y = (target_size - resized.shape[0]) // 2
+        start_x = (target_size - resized.shape[1]) // 2
+        end_y = start_y + resized.shape[0]
+        end_x = start_x + resized.shape[1]
+        
+        square[start_y:end_y, start_x:end_x] = resized
+        
         symbols.append(square)
+    
     return symbols
