@@ -105,15 +105,23 @@ def generate_operators(samples_per_class=1000):
                 angle = random.uniform(-20, 20)
                 img = img.rotate(angle, expand=False, fillcolor=bg_color)
             
-            # Perspective distortion
+            # Safe perspective distortion
             if random.random() < 0.2:
                 arr = np.array(img)
                 h, w = arr.shape
+                # Create valid perspective points
+                offset = random.uniform(1, 3)
                 pts1 = np.float32([[0,0], [w,0], [0,h], [w,h]])
-                pts2 = pts1 + np.random.uniform(-3, 3, pts1.shape)
-                M = cv2.getPerspectiveTransform(pts1, pts2)
-                arr = cv2.warpPerspective(arr, M, (w, h), borderValue=bg_color)
-                img = Image.fromarray(arr)
+                pts2 = np.float32([
+                    [offset, offset], [w-offset, offset], 
+                    [offset, h-offset], [w-offset, h-offset]
+                ])
+                try:
+                    M = cv2.getPerspectiveTransform(pts1, pts2)
+                    arr = cv2.warpPerspective(arr, M, (w, h), borderValue=bg_color)
+                    img = Image.fromarray(arr)
+                except:
+                    pass  # Skip if transform fails
             
             # Blur and noise
             if random.random() < 0.3:
@@ -125,20 +133,19 @@ def generate_operators(samples_per_class=1000):
                 arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
                 img = Image.fromarray(arr)
             
-            # Elastic deformation for more realistic handwriting
+            # Simple elastic deformation (safer)
             if random.random() < 0.2:
-                arr = np.array(img)
-                # Simple elastic deformation
-                rows, cols = arr.shape
-                src_cols = np.linspace(0, cols, 10)
-                src_rows = np.linspace(0, rows, 10)
-                src_rows, src_cols = np.meshgrid(src_rows, src_cols)
-                dst_rows = src_rows + np.random.uniform(-2, 2, src_rows.shape)
-                dst_cols = src_cols + np.random.uniform(-2, 2, src_cols.shape)
-                
-                tform = cv2.resize(np.dstack([dst_cols.ravel(), dst_rows.ravel()])[0], (cols, rows))
-                arr = cv2.remap(arr, tform[:,:,0].astype(np.float32), tform[:,:,1].astype(np.float32), cv2.INTER_LINEAR, borderValue=bg_color)
-                img = Image.fromarray(arr)
+                try:
+                    arr = np.array(img)
+                    rows, cols = arr.shape
+                    # Simple wave distortion
+                    for i in range(rows):
+                        shift = int(2 * np.sin(2 * np.pi * i / rows))
+                        if shift != 0:
+                            arr[i] = np.roll(arr[i], shift)
+                    img = Image.fromarray(arr)
+                except:
+                    pass  # Skip if deformation fails
             
             # Resize to standard size
             img = img.resize((64, 64), Image.Resampling.LANCZOS)
